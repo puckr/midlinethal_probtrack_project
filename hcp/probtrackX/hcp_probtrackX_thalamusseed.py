@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+#load all the dependencies you will use in your script
 import nipype.interfaces.io as nio
 import nipype.interfaces.fsl as fsl
 import nipype.interfaces.utility as util
@@ -9,11 +10,13 @@ from nipype import Node
 from nipype.interfaces.utility import IdentityInterface
 import os
 
+#Create a definition that will iterate over left, and then right hemisphere
 def hemispherize(in_files):
     lh_list = [x for x in in_files if "lh_" in x or "brainstem" in x]
     rh_list = [x for x in in_files if "rh_" in x or "brainstem" in x]
     return [lh_list, rh_list]
 
+#Create a definition that will set up the probabilistic tractography workflow
 def pbX_wf(subject_id,
            sink_directory,
            name='hcp_pbX'):
@@ -31,6 +34,7 @@ def pbX_wf(subject_id,
 
     # Create a datasource node to get the dwi, bvecs, and bvals
     #This uses the dictionary created above and inputs the keys from the dictionary
+    #This node will be looking for outputs from the bedpostX step (see FSL tutorials)
     datasource = pe.Node(interface=nio.DataGrabber(infields=['subject_id'],outfields=list(info.keys())),name = 'datasource')
     datasource.inputs.template = '%s/%s'
     datasource.inputs.subject_id = subject_id
@@ -46,33 +50,32 @@ def pbX_wf(subject_id,
     datasource.inputs.sort_filelist = True
 
     # Create a flirt node to calculate the dmri_brain to fs_brain xfm
-    #Basically creating a conversion from DWI space to Freesurfer space
+    #Creates a conversion from DWI space to Freesurfer space
     dmri2fs_xfm = pe.Node(fsl.FLIRT(), name = 'dmri2fs_xfm')
     dmri2fs_xfm.inputs.out_matrix_file = 'dmri_2_fs_xfm.mat'
     hcp_pbX_wf.connect(datasource, 'dmri_brain', dmri2fs_xfm, 'in_file')
     hcp_pbX_wf.connect(datasource, 'fs_brain', dmri2fs_xfm, 'reference')
 
     # Create a convertxfm node to create inverse xfm of dmri2fs affine
-    # Basicaaly creating a conversion from freesurfer space to DWI space
+    # Creates a conversion from freesurfer space to DWI space
     invt_dmri2fs = pe.Node(fsl.ConvertXFM(), name= 'invt_dmri2fs')
     invt_dmri2fs.inputs.invert_xfm = True
     invt_dmri2fs.inputs.out_file = 'fs_2_dmri_xfm.mat'
     hcp_pbX_wf.connect(dmri2fs_xfm, 'out_matrix_file', invt_dmri2fs, 'in_file')
 
-    # Extract thalamus seed masks from aparc+aseg.nii.gz file
+    # Extract thalamus seed masks from aparc+aseg.nii.gz file from freesurfer
     # Here 10 is the left thalamus, and 49 is the right thalamus
     thal_seed_mask = pe.MapNode(fs.Binarize(),
                                iterfield=['match', 'binary_file'],
                                name='thal_seed_mask')
-    #thal_seed_mask.inputs.subject_dir = 'aparcaseg'
     thal_seed_mask.inputs.match = [[10],[49]]
     thal_seed_mask.inputs.binary_file = ['lft_thal.nii.gz', 'rt_thal.nii.gz']
     hcp_pbX_wf.connect(datasource, 'aparcaseg', thal_seed_mask, 'in_file')
-    
+
     #Next we need to avoid the ventricles by creating an -avoid_mask
     #There are no left and right 3rd and 4th ventricle, so we are making one mask
-    avoid_mask = pe.Node(fs.Binarize(), 
-                         #out_type='nii.gz', 
+    avoid_mask = pe.Node(fs.Binarize(),
+                         #out_type='nii.gz',
                          name='avoid_mask')
     #avoid_mask.inputs.subject_dir = 'aparcaseg'
     avoid_mask.inputs.match = [4, 14, 15, 43, 72] #lft_lat_ven, 3rd_ven, 4th_ven, rgt_lat_ven, 5th_ven
@@ -85,7 +88,6 @@ def pbX_wf(subject_id,
     ctx_targ_mask = pe.MapNode(fs.Binarize(),
                                iterfield=['match', 'binary_file'],
                                name='ctx_targ_mask')
-    #ctx_targ_mask.inputs.subject_dir = 'aparcaseg'
     ctx_targ_mask.inputs.match = [[1024], [1022], [1003, 1028, 1027, 1012, 1019, 1020, 1032],
                                   [1031, 1029, 1008], [1009, 1015, 1033, 1035, 1034, 1030],
                                   [1011], [1017], [1002], [1014], [1026], [1028],
@@ -111,7 +113,7 @@ def pbX_wf(subject_id,
 
 
     # Create a flirt node to apply inverse transform to seeds
-    # Basically you convert the masks (seeds) that were in freesurfer space to the DWI space
+    # This will convert the masks (seeds) that were in freesurfer space to the DWI space
     seedxfm_fs2dmri = pe.MapNode(fsl.FLIRT(),
                                  iterfield = ['in_file'],
                                  name='seedxfm_fs2dmri')
@@ -141,39 +143,29 @@ def pbX_wf(subject_id,
     hcp_pbX_wf.connect(datasource, 'dmri_brain', avoidmaskxfm_fs2dmri, 'reference')
     hcp_pbX_wf.connect(invt_dmri2fs, 'out_file', avoidmaskxfm_fs2dmri, 'in_matrix_file')
 
-    # Compute motion regressors (save file with 1st and 2nd derivatives)
-    #make_targ_lists = pe.Node(util.Function(input_names=['in_files'],
-    #                                        output_names='out_list',
-    #                                        function=create_two_lists),
-    #                          name='make_targ_lists')
-    #hcp_pbX_wf.connect(targxfm_fs2dmri, 'out_file', make_targ_lists, 'in_files')
-
-    #PROBTRACKX NODE 
+    #This node runs the probabilistic tractography analysis
     pbx2 = pe.MapNode(fsl.ProbTrackX2(),
-                      iterfield = ['seed', 'target_masks'], #Should I have included avoid_mp here?
+                      iterfield = ['seed', 'target_masks'],
                       name='pbx2')
     pbx2.inputs.c_thresh = 0.2
     pbx2.inputs.n_steps=2000
     pbx2.inputs.step_length=0.5
-    pbx2.inputs.n_samples=25000
+    pbx2.inputs.n_samples=25000 #Use 25000 samples (or more)
     pbx2.inputs.opd=True
     pbx2.inputs.os2t=True
     pbx2.inputs.loop_check=True
-    #pbx2.plugin_args = {'bsub_args': '-q PQ_madlab'} #old way new way below
     pbx2.plugin_args = {'sbatch_args': ('-p IB_40C_1.5T --qos pq_madlab --account iacc_madlab -N 1 -n 6')}
     hcp_pbX_wf.connect(datasource, 'merged_thsamples', pbx2, 'thsamples')
     hcp_pbX_wf.connect(datasource, 'merged_phsamples', pbx2, 'phsamples')
     hcp_pbX_wf.connect(datasource, 'merged_fsamples', pbx2, 'fsamples')
     hcp_pbX_wf.connect(seedxfm_fs2dmri, 'out_file', pbx2, 'seed')
     hcp_pbX_wf.connect(targxfm_fs2dmri, ('out_file', hemispherize), pbx2, 'target_masks')
-    #hcp_pbX_wf.connect(make_targ_lists, 'out_list', pbx2, 'target_masks')
     hcp_pbX_wf.connect(avoidmaskxfm_fs2dmri, 'out_file', pbx2, 'avoid_mp')
     hcp_pbX_wf.connect(datasource, 'mask', pbx2, 'mask')
-    
 
-    # Create a findthebiggest node to do hard segmentation between
-    # seeds and targets
-    #basically this segments the seed region on the basis of outputs of probtrackX when classification targets are being used. 
+
+    # Create a findthebiggest node to do hard segmentation between seeds and targets
+    # This segments the seed region on the basis of outputs of probtrackX when classification targets are being used.
     findthebiggest = pe.MapNode(fsl.FindTheBiggest(),
                                 iterfield = ['in_files'],
                                 name='findthebiggest')
@@ -188,11 +180,7 @@ def pbX_wf(subject_id,
     hcp_pbX_wf.connect(pbx2, 'way_total', datasink, 'hcpprobX.waytotal')
     hcp_pbX_wf.connect(pbx2, 'targets', datasink, 'hcpprobX.targets')
     hcp_pbX_wf.connect(findthebiggest, 'out_file', datasink, 'hcpprobX.fbiggest.@biggestsegmentation')
-    #hcp_pbX_wf.connect(thal_seed_mask, 'binary_file', datasink, 'hcpprobX.thal_mask')
     hcp_pbX_wf.connect(seedxfm_fs2dmri, 'out_file', datasink, 'hcpprobX.seed_masks')
-    #from seed_xsfm(out_file) to datasink "seed_files"
-    #do we need this - > emu_pbX_wf.connect(datasource, 'ref_b0', datasink, 'emuprobX.b0')
-    #do we need this - > emu_pbX_wf.connect(thal_seed_mask, 'binary_file', datasink, 'emuprobX.thal_mask')
 
     return hcp_pbX_wf
 
@@ -202,7 +190,7 @@ Creates the full workflow
 """
 
 def create_probX_workflow(args, name='hcp_probX'):
-    
+
     kwargs = dict(subject_id=args.subject_id,
                   sink_directory=os.path.abspath(args.out_dir),
                   name=name)
@@ -226,8 +214,7 @@ if __name__ == "__main__":
         work_dir = os.path.abspath(args.work_dir)
     else:
         work_dir = os.getcwd()
-    
+
     wf.config['execution']['crashdump_dir'] = '/scratch/madlab/crash/hcp_probX'
     wf.base_dir = work_dir + '/' + args.subject_id
-    # OLD: wf.run(plugin='LSF', plugin_args={'bsub_args': '-q PQ_madlab'})
     wf.run(plugin='SLURM', plugin_args={'sbatch_args': ('-p IB_44C_512G --qos pq_madlab --account iacc_madlab -N 1 -n 1'), 'overwrite': True})
